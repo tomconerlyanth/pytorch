@@ -26,7 +26,19 @@ using CuBlasPoolType = DeviceThreadHandlePool<cublasHandle_t, createCublasHandle
 } // namespace
 
 static int64_t WORKSPACE_SIZE = 16 * 1024 * 1024;
-static std::map<cublasHandle_t, void*> handle_to_workspace;
+
+struct WorkspaceAllocation {
+  // Wrapper around cudaMalloc/cudaFree that we can use with std::unique_ptr
+  WorkspaceAllocation() {
+    AT_CUDA_CHECK(cudaMalloc(&allocation_, WORKSPACE_SIZE));
+  }
+  ~WorkspaceAllocation() {
+    // Don't check for failure here. During shutdown we'll cudaFree after cuda has been destroyed,
+    // but we don't care because we're shutting down.
+    cudaFree(allocation_);
+  }
+  void* allocation_;
+};
 
 cublasHandle_t getCurrentCUDABlasHandle() {
   int device;
@@ -47,15 +59,17 @@ cublasHandle_t getCurrentCUDABlasHandle() {
   thread_local std::unique_ptr<CuBlasPoolType::PoolWindow> myPoolWindow(
       pool->newPoolWindow());
 
+  // Note these are deleted when threads are deallocated so the memory will be freed eventually
+  thread_local std::unique_ptr<WorkspaceAllocation> myWorkspaceAllocation(new WorkspaceAllocation());
+
   auto handle = myPoolWindow->reserve(device);
   auto stream = c10::cuda::getCurrentCUDAStream();
   TORCH_CUDABLAS_CHECK(cublasSetStream(handle, stream));
-  if (handle_to_workspace.find(handle) == handle_to_workspace.end()) {
-      void* workspace_ptr;
-      AT_CUDA_CHECK(cudaMalloc(&workspace_ptr, WORKSPACE_SIZE));
-      handle_to_workspace[handle] = workspace_ptr;
-  }
-  TORCH_CUDABLAS_CHECK(cublasSetWorkspace(handle, handle_to_workspace[handle], WORKSPACE_SIZE));
+  // Cublas docs (https://docs.nvidia.com/cuda/cublas/index.html#CUDA-graphs) say that it will
+  // leak memory when used with cuda graphs. Manually set the workspace so it doesn't get leaked.
+  // This is only safe because our use case doesn't have multiple inflight cublas operations at 
+  // the same time.
+  TORCH_CUDABLAS_CHECK(cublasSetWorkspace(handle, myWorkspaceAllocation->allocation_, WORKSPACE_SIZE));
 #if CUDA_VERSION >= 11000
   // On CUDA >= 11, and architecture >= Ampere, cuBLAS can use TF32 to speedup
   // FP32 data type calculations based on the value of the allow_tf32 flag.
