@@ -26,7 +26,16 @@ using CuBlasPoolType = DeviceThreadHandlePool<cublasHandle_t, createCublasHandle
 } // namespace
 
 static int64_t WORKSPACE_SIZE = 16 * 1024 * 1024;
-static std::map<cublasHandle_t, void*> handle_to_workspace;
+
+struct WorkspaceAllocation {
+  WorkspaceAllocation() {
+    AT_CUDA_CHECK(cudaMalloc(&allocation_, WORKSPACE_SIZE));
+  }
+  ~WorkspaceAllocation() {
+    AT_CUDA_CHECK(cudaFree(allocation_));
+  }
+  void* allocation_;
+};
 
 cublasHandle_t getCurrentCUDABlasHandle() {
   int device;
@@ -47,15 +56,12 @@ cublasHandle_t getCurrentCUDABlasHandle() {
   thread_local std::unique_ptr<CuBlasPoolType::PoolWindow> myPoolWindow(
       pool->newPoolWindow());
 
+  thread_local std::unique_ptr<WorkspaceAllocation> myWorkspaceAllocation(new WorkspaceAllocation());
+
   auto handle = myPoolWindow->reserve(device);
   auto stream = c10::cuda::getCurrentCUDAStream();
   TORCH_CUDABLAS_CHECK(cublasSetStream(handle, stream));
-  if (handle_to_workspace.find(handle) == handle_to_workspace.end()) {
-      void* workspace_ptr;
-      AT_CUDA_CHECK(cudaMalloc(&workspace_ptr, WORKSPACE_SIZE));
-      handle_to_workspace[handle] = workspace_ptr;
-  }
-  TORCH_CUDABLAS_CHECK(cublasSetWorkspace(handle, handle_to_workspace[handle], WORKSPACE_SIZE));
+  TORCH_CUDABLAS_CHECK(cublasSetWorkspace(handle, myWorkspaceAllocation->allocation_, WORKSPACE_SIZE));
 #if CUDA_VERSION >= 11000
   // On CUDA >= 11, and architecture >= Ampere, cuBLAS can use TF32 to speedup
   // FP32 data type calculations based on the value of the allow_tf32 flag.
